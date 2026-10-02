@@ -1,25 +1,77 @@
 import sys
-from PyQt5.QtWidgets import QApplication, QMainWindow
+import time
+import os
+from collections import deque
+
+import asyncio
+import cv2
+import numpy as np
+import torchvision.transforms.transforms as transforms
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import QTimer
+from PyQt5.QtWidgets import QApplication, QMainWindow
+from threading import Thread, Event
+
 from main_window_ui import Ui_MainWindow    # example这里是你的命名文件
 from menu_ui import Ui_register_2
 from register_ui import Ui_register_3
-from threading import Thread,Event
 ##########import face dlib module #############
 from val_recognize.face_dlib.face_reco_from_camera import Face_Recognizer
 from val_recognize.face_dlib.features_extraction_to_csv import main_tranfer
 import HandTrackingModule as htm
 from downstream_task.detection.model import build_yolo_people_detection
-import cv2
-import torchvision.transforms.transforms as transforms
 from mavsdk import System
 from mavsdk.offboard import (OffboardError, VelocityNedYaw)
-import time
-import os
-import numpy as np
-# 登录界面
-import asyncio
+
+
+class CameraStream:
+    """Helper class for managing OpenCV capture and FPS tracking."""
+
+    def __init__(self, camera_index: int = 0):
+        self.camera_index = camera_index
+        self.cap = None
+        self.frame_start_time = None
+        self.start_time = None
+        self.fps = 0.0
+        self.fps_show = 0.0
+        self.frame_time = 0.0
+        self.ensure_camera()
+
+    def ensure_camera(self):
+        if self.cap is None or not self.cap.isOpened():
+            self.cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
+            now = time.time()
+            self.frame_start_time = now
+            self.start_time = now
+
+    def read(self):
+        self.ensure_camera()
+        ret, frame = self.cap.read()
+        if not ret:
+            return False, None
+        return True, cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    def update_fps(self) -> float:
+        now = time.time()
+        if self.frame_start_time is None:
+            self.frame_start_time = now
+        if self.start_time is None:
+            self.start_time = now
+        if int(self.start_time) != int(now):
+            self.fps_show = self.fps
+        self.frame_time = now - self.frame_start_time if self.frame_start_time else 0.0
+        if self.frame_time > 0:
+            self.fps = 1.0 / self.frame_time
+        self.frame_start_time = now
+        self.start_time = now
+        return self.fps
+
+    def release(self):
+        if self.cap and self.cap.isOpened():
+            self.cap.release()
+        self.cap = None
+
+
 class thread_auto_start_and_stop(Thread):
     def __init__(self,target=None,daemon=None):
         super(thread_auto_start_and_stop,self).__init__()
@@ -40,7 +92,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.register=self.pushButton
         self.login=self.pushButton_2
         self.login_camera_button=self.pushButton_3
-        self.frameToAnalyze=[]
+        self.frameToAnalyze=deque(maxlen=1)
        
         #########实时处理###########
         self.is_get=0
@@ -55,20 +107,11 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.login_camera=self.label
         self.info_path=r"val_recognize/user_info"
         self.flag=0
-
-        self.cap=cv2.VideoCapture(0,cv2.CAP_DSHOW)
+        self.camera_stream = CameraStream()
         self.name=''
         # 启动处理视频帧独立线程
-        
+
         Thread(target=self.frameAnalyzeThreadFunc,daemon=True).start()
-        self.login_frame=np.ndarray
-        self.name=[]
-        # FPS
-        self.frame_time = 0
-        self.frame_start_time = 0
-        self.fps = 0
-        self.fps_show = 0
-        self.start_time = time.time()
         self.register.clicked.connect(self.open_register)
         self.login_camera_button.clicked.connect(self.login_button_open_camera_click)
         self.login.clicked.connect(self.check_is_login)
@@ -78,29 +121,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         if not os.path.exists(self.info_path):
             os.makedirs(self.info_path)
 
-    # 更新 FPS / Update FPS of Video stream
-    def update_fps(self):
-        now = time.time()
-        # 每秒刷新 fps / Refresh fps per second
-        if str(self.start_time).split(".")[0] != str(now).split(".")[0]:
-            self.fps_show = self.fps
-        self.start_time = now
-        self.frame_time = now - self.frame_start_time
-        self.fps = 1.0 / self.frame_time
-        self.frame_start_time = now
-
     def close_register(self):
         self.reg.close()
         self.reg.timer_reg.stop()
         self.Open()
 
     def get_frame(self):
-        if self.cap.isOpened():
-            ret, frame = self.cap.read()
-        else:
-            self.cap=cv2.VideoCapture(0,cv2.CAP_DSHOW)
-            ret, frame = self.cap.read()
-        return ret, cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return self.camera_stream.read()
         
 
     def change_status(self):
@@ -109,12 +136,11 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
     def frameAnalyzeThreadFunc(self):
         while True:
-            if len(self.frameToAnalyze)==0:
+            if not self.frameToAnalyze:
                 time.sleep(0.01)
-                # print(1)
                 continue
             else:
-                login_frame = self.frameToAnalyze.pop(0)
+                login_frame = self.frameToAnalyze.popleft()
                 img,self.is_get,results=self.face_rec.process(login_frame)
                 # print(results)
                 if self.is_get==1:
@@ -136,7 +162,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.login_timer_check.stop()
             self.login_camera_button.setText("关闭识别")
             self.login_camera.clear()
-            self.cap.release()
+            self.camera_stream.release()
             self.login_camera.setText("")
 
 
@@ -144,14 +170,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         ret, login_frame=self.get_frame()
         if ret:
             result=login_frame
-            self.update_fps()
-            # if self.is_get==0:
-            cv2.putText(result, f'FPS:{int(self.fps)}', (270, 40), cv2.FONT_HERSHEY_COMPLEX, 1, (255,255, 255), 2)
+            fps = self.camera_stream.update_fps()
+            cv2.putText(result, f'FPS:{int(fps)}', (270, 40), cv2.FONT_HERSHEY_COMPLEX, 1, (255,255, 255), 2)
             result = QtGui.QImage(result.data, result.shape[1], result.shape[0], QtGui.QImage.Format_RGB888)
             self.login_camera.setPixmap(QtGui.QPixmap.fromImage(result))
-            if len(self.frameToAnalyze)==0:
+            if not self.frameToAnalyze:
                 self.frameToAnalyze.append(login_frame)
-                # print(1)
             if self.name and self.name!='unknown':
                 time.sleep(1)
                 self.login_fun()
@@ -186,7 +210,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.login_timer_check.stop()
         self.user_name.clear()
         self.password.clear()
-        self.cap.release()
+        self.camera_stream.release()
         self.menu.Open()
         self.close()
             
@@ -214,28 +238,22 @@ class Register(QMainWindow, Ui_register_3):
         self.account_Register.clicked.connect(self.load_info)
         self.pic=np.ndarray
         self.is_detect=False
-        self.cap=cv2.VideoCapture(0,cv2.CAP_DSHOW)
+        self.camera_stream = CameraStream()
         self.timer_reg = QTimer(self)
-        self.register_frame=[]
+        self.register_frame=deque(maxlen=1)
         self.timer_reg.timeout.connect(self.recognize_face)
         Thread(target=self.frameAnalyzeThreadFunc,daemon=True).start()
-         # FPS
-        self.frame_time = 0
-        self.frame_start_time = 0
-        self.fps = 0
-        self.fps_show = 0
-        self.start_time = time.time()
         self.dir_name=''
         self.info_path=r"val_recognize/user_info"
         self.img_path=r"val_recognize/face_dlib/data/data_faces_from_camera"
 
     def frameAnalyzeThreadFunc(self):
         while True:
-            if len(self.register_frame)==0:
+            if not self.register_frame:
                 time.sleep(0.01)
                 continue
             else:
-                login_frame = self.register_frame.pop(0)
+                login_frame = self.register_frame.popleft()
                 faces,result=self.face_rec.recoginition(login_frame)
                 print('faces',len(faces))
                 if len(faces)==1:
@@ -249,36 +267,19 @@ class Register(QMainWindow, Ui_register_3):
                     self.is_detect=False
                     continue
                 
-    # 更新 FPS / Update FPS of Video stream
-    def update_fps(self):
-        now = time.time()
-        # 每秒刷新 fps / Refresh fps per second
-        if str(self.start_time).split(".")[0] != str(now).split(".")[0]:
-            self.fps_show = self.fps
-        self.start_time = now
-        self.frame_time = now - self.frame_start_time
-        self.fps = 1.0 / self.frame_time
-        self.frame_start_time = now
-
     def get_frame(self):
-        if self.cap.isOpened():
-            ret, frame = self.cap.read()
-            return ret, cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        else:
-            self.cap=cv2.VideoCapture(0,cv2.CAP_DSHOW)
-            ret, frame = self.cap.read()
-            return ret, cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return self.camera_stream.read()
        
 
     def recognize_face(self):
         ret,register_frame=self.get_frame()
         if ret:
-            self.update_fps()
+            fps = self.camera_stream.update_fps()
             result=register_frame
-            cv2.putText(result, f'FPS:{int(self.fps)}', (270, 40), cv2.FONT_HERSHEY_COMPLEX, 1, (255,255, 255), 2)
+            cv2.putText(result, f'FPS:{int(fps)}', (270, 40), cv2.FONT_HERSHEY_COMPLEX, 1, (255,255, 255), 2)
             result = QtGui.QImage(result.data, result.shape[1], result.shape[0], QtGui.QImage.Format_RGB888)
             self.camera.setPixmap(QtGui.QPixmap.fromImage(result))
-            if len(self.register_frame)==0:
+            if not self.register_frame:
                 self.register_frame.append(register_frame)
 
 
@@ -296,7 +297,7 @@ class Register(QMainWindow, Ui_register_3):
             self.timer_reg.stop()
             self.camera_button.setText("关闭检测")
             self.camera.clear()
-            self.cap.release()
+            self.camera_stream.release()
             self.camera.setText("")
     
     
@@ -343,7 +344,7 @@ class Menu(QMainWindow, Ui_register_2):
         super(Menu, self).__init__(parent)
         self.setupUi(self)
         self.transform=transforms.Compose([transforms.ToTensor(),transforms.Resize((512,512))])
-        self.cap=cv2.VideoCapture(0,cv2.CAP_DSHOW)
+        self.camera_stream = CameraStream()
         self.time_start_flag=0
         self.battery = self.lcdNumber_7
         self.speed_x = self.lcdNumber_9
@@ -354,18 +355,11 @@ class Menu(QMainWindow, Ui_register_2):
         self.sx=0
         self.sy=0
         self.sz=0
-        # self.manuel_control_step=[]
-        self.manual_inputs = [
-            [0, 0, 0.5, 0],  # no movement 
-            [-1, 0, 0.5, 0],  # minimum roll
-            [1, 0, 0.5, 0],  # maximum roll
-            [0, -1, 0.5, 0],  # minimum pitch
-            [0, 1, 0.5, 0],  # maximum pitch
-            [0, 0, 0.5, -1],  # minimum yaw
-            [0, 0, 0.5, 1],  # maximum yaw
-            [-1, 0, 1, 0],  # max throttle
-            [0, 0, 0, 0],  # minimum throttle
-        ]
+        self.manual_inputs = {
+            "hover": (0.0, 0.0, 0.5, 0.0),
+            "yaw_left": (0.0, 0.0, 0.5, -1.0),
+            "yaw_right": (0.0, 0.0, 0.5, 1.0),
+        }
         #打开定时器，对于每次定时器读取命令做出对应的抉择。
         self.keyboard_control = self.pushButton_12
         self.hands_control = self.pushButton_11
@@ -384,7 +378,7 @@ class Menu(QMainWindow, Ui_register_2):
         self.is_connect=self.checkBox_2
         self.stop_event=Event()
         self.drone=System()
-        self.command=[]
+        self.command_queue=deque()
         self.velocity=2.0
         # self.thread_command=Thread(target=self.display_command,daemon=True)
         self.object_model=build_yolo_people_detection()
@@ -398,15 +392,22 @@ class Menu(QMainWindow, Ui_register_2):
         self.timer_tsk.timeout.connect(self.update_camera)
         self.timer_update_info=QTimer()
         self.timer_update_info.timeout.connect(self.update_flight_info)
-        self.frame_to_tsk=[]
+        self.frame_to_tsk=deque(maxlen=1)
         self.t=thread_auto_start_and_stop()
         Thread(target=self.object_detection,daemon=True).start()
-        #fps
-        self.frame_time = 0
-        self.frame_start_time = 0
-        self.fps = 0
-        self.fps_show = 0
-        self.start_time = time.time()
+        self.command_handlers = {
+            "向右": lambda: self._handle_velocity(0.0, -self.velocity, 0.0, (0.0, self.velocity, 0.0)),
+            "向左": lambda: self._handle_velocity(0.0, self.velocity, 0.0, (0.0, -self.velocity, 0.0)),
+            "向前": lambda: self._handle_velocity(self.velocity, 0.0, 0.0, (self.velocity, 0.0, 0.0)),
+            "向后": lambda: self._handle_velocity(-self.velocity, 0.0, 0.0, (-self.velocity, 0.0, 0.0)),
+            "上升": lambda: self._handle_velocity(0.0, 0.0, -self.velocity, (0.0, 0.0, -self.velocity)),
+            "下降": lambda: self._handle_velocity(0.0, 0.0, self.velocity, (0.0, 0.0, self.velocity)),
+            "向左转向": lambda: self._set_manual_control(self.manual_inputs["yaw_left"], (0.0, 0.0, 0.0)),
+            "向右转向": lambda: self._set_manual_control(self.manual_inputs["yaw_right"], (0.0, 0.0, 0.0)),
+            "悬停": lambda: self._set_manual_control(self.manual_inputs["hover"], (0.0, 0.0, 0.0)),
+            "起飞": self.takeoff,
+            "降落": self.land,
+        }
     def loop_in_thread(self,_new_loop):  # 一个将被丢进线程的函数
         asyncio.set_event_loop(_new_loop)  # 调用loop需要使用set_event_loop方法指定loop
         _new_loop.run_forever()  # run_forever() 会永远阻塞当前线程，直到有人停止了该loop为止。
@@ -424,16 +425,6 @@ class Menu(QMainWindow, Ui_register_2):
             self.stop_event.set()
             print("have been stopped!")
         self.time_start_flag=1-self.time_start_flag
-    # 更新 FPS / Update FPS of Video stream
-    def update_fps(self):
-        now = time.time()
-        # 每秒刷新 fps / Refresh fps per second
-        if str(self.start_time).split(".")[0] != str(now).split(".")[0]:
-            self.fps_show = self.fps
-        self.start_time = now
-        self.frame_time = now - self.frame_start_time
-        self.fps = 1.0 / self.frame_time
-        self.frame_start_time = now
     def update_camera(self,tsk):
         """
         tsk=[obj_detection,sfm]
@@ -441,14 +432,7 @@ class Menu(QMainWindow, Ui_register_2):
         """
         ret,frame=self.get_frame()
     def get_frame(self):
-        # if self.timer_camera.isActive() == False:  # 若定时器未启动
-        #     self.timer_camera.start(50)
-        if self.cap.isOpened():
-            ret, frame = self.cap.read()
-        else:
-            self.cap=cv2.VideoCapture(0,cv2.CAP_DSHOW)
-            ret, frame = self.cap.read()
-        return ret, cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return self.camera_stream.read()
     def change_status(self):
         self.flag=1-self.flag
     def update_flight_info(self):
@@ -458,7 +442,7 @@ class Menu(QMainWindow, Ui_register_2):
         self.speed_z.display(int(self.sz))
     def takeoff_offer(self):
         def offer_command_takeoff():
-            asyncio.run(self.takeoff_and_land())
+            asyncio.run(self.takeoff())
         def offer_command_land():
             asyncio.run(self.land())
         if self.takeoff_button.text()=='起飞':
@@ -506,80 +490,35 @@ class Menu(QMainWindow, Ui_register_2):
             print(f"电池状态: {battery}")
             self.volt=battery.voltage_v
             break
-        while(True):
-            if len(self.command)!=0:
-                command=self.command[-1]
+        while True:
+            if self.command_queue:
+                command=self.command_queue.popleft()
                 print(command)
-                
-                if command=='向右':
-                    # [roll,pitch,throttle,yaw]=self.manual_inputs[2]
-                    # await self.drone.manual_control.set_manual_control_input(
-                    #     float(roll), float(pitch), float(throttle), float(yaw)
-                    # )
-                    await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, -self.velocity, 0.0, 0.0))
-                    self.sx=0
-                    self.sy=self.velocity
-                    self.sz=0
-                    await asyncio.sleep(0.1)
-                if command=='向左':
-                    # [roll,pitch,throttle,yaw]=self.manual_inputs[1]
-                    # await self.drone.manual_control.set_manual_control_input(
-                    #     float(roll), float(pitch), float(throttle), float(yaw)
-                    # )
-                    await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, self.velocity, 0.0, 0.0))
-                    self.sx=0
-                    self.sy=0
-                    self.sz=self.velocity
-                    await asyncio.sleep(0.1)
-                if command=='上升':
-                    await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, -self.velocity, 0.0))
-                    self.sx=0
-                    self.sy=self.velocity
-                    self.sz=0
-                    await asyncio.sleep(0.1)
-                if command=='向前':
-                    await self.drone.offboard.set_velocity_ned(VelocityNedYaw(self.velocity, 0.0, 0.0, 0.0))
-                    self.sx=self.velocity
-                    self.sy=0
-                    self.sz=0
-                    await asyncio.sleep(0.1)
-                if command=='向后':
-                    await self.drone.offboard.set_velocity_ned(VelocityNedYaw(-self.velocity, 0.0, 0.0, 0.0))
-                    self.sx=self.velocity
-                    self.sy=0
-                    self.sz=0
-                    await asyncio.sleep(0.1)
-                if command=='向左转向':
-                    [roll,pitch,throttle,yaw]=self.manual_inputs[5]
-                    await self.drone.manual_control.set_manual_control_input(
-                        float(roll), float(pitch), float(throttle), float(yaw)
-                    )
-                    await asyncio.sleep(0.1)
-                if command=='下降':
-                    await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, self.velocity, 0.0))
-                    self.sx=0
-                    self.sy=0
-                    self.sz=self.velocity
-                    await asyncio.sleep(0.1)
-                if command=='向右转向':
-                    [roll,pitch,throttle,yaw]=self.manual_inputs[6]
-                    await self.drone.manual_control.set_manual_control_input(
-                        float(roll), float(pitch), float(throttle), float(yaw)
-                    )
+                handler=self.command_handlers.get(command, self._hover)
+                result = handler()
+                if asyncio.iscoroutine(result):
+                    await result
                 else:
-                    [roll,pitch,throttle,yaw]=self.manual_inputs[0]
-                    await self.drone.manual_control.set_manual_control_input(
-                        float(roll), float(pitch), float(throttle), float(yaw)
-                    )
                     await asyncio.sleep(0.1)
-                self.command.pop()
-                await asyncio.sleep(0.1)
             else:
-                [roll,pitch,throttle,yaw]=self.manual_inputs[0]
-                await self.drone.manual_control.set_manual_control_input(
-                    float(roll), float(pitch), float(throttle), float(yaw)
-                )
-        
+                await self._hover()
+
+    async def _handle_velocity(self, north: float, east: float, down: float, display_speeds):
+        await self.drone.offboard.set_velocity_ned(VelocityNedYaw(north, east, down, 0.0))
+        self.sx, self.sy, self.sz = display_speeds
+        await asyncio.sleep(0.1)
+
+    async def _set_manual_control(self, inputs, display_speeds):
+        roll, pitch, throttle, yaw = inputs
+        await self.drone.manual_control.set_manual_control_input(
+            float(roll), float(pitch), float(throttle), float(yaw)
+        )
+        self.sx, self.sy, self.sz = display_speeds
+        await asyncio.sleep(0.1)
+
+    async def _hover(self):
+        await self._set_manual_control(self.manual_inputs["hover"], (0.0, 0.0, 0.0))
+
         
     def button_open_camera_click(self):
         self.change_status()
@@ -591,7 +530,7 @@ class Menu(QMainWindow, Ui_register_2):
             self.timer_tsk.stop()
             self.license_identify.setText("关闭行人检测")
             self.air_view.clear()
-            self.cap.release()
+            self.camera_stream.release()
             self.air_view.setText("无人机端")
     def hand_control(self):
         if self.hands_control.text()=="开启手势控制":
@@ -664,12 +603,12 @@ class Menu(QMainWindow, Ui_register_2):
                     if (takeoffcy - lmList[8][2]) ** 2 + (takeoffcx - lmList[8][1]) ** 2 < 13 ** 2:
                         takeoff = 1
                         if flag == 0:
-                            self.command.append("起飞")
+                            self.command_queue.append("起飞")
                             self.hands_signal.setText("起飞")
                             flag = 1
                     if (launchcy - lmList[8][2]) ** 2 + (launchcx - lmList[8][1]) ** 2 < 13 ** 2:
                         takeoff = 0
-                        self.command.append("降落")
+                        self.command_queue.append("降落")
                         self.hands_signal.setText("降落")
                         flag = 0
                         # print("降落")
@@ -686,26 +625,26 @@ class Menu(QMainWindow, Ui_register_2):
                             if lmList[8][1] < LeftPx:  # 手指在第一象限
                                 if direction < 1:
                                     # print("向左")
-                                    self.command.append("向左")
+                                    self.command_queue.append("向左")
                                     self.hands_signal.setText("向左")
                                     val[0] = -lr
                                     # self.me.send_rc_control(-lr, 0, 0, 0)
                                 else:
                                     # print("向前")
-                                    self.command.append("向前")
+                                    self.command_queue.append("向前")
                                     self.hands_signal.setText("向前")
                                     val[1] = fb
                                     # self.me.send_rc_control(0, fb, 0, 0)
                             else:  # 手指在第四象限
                                 if direction < 1:
                                     # print("向右")
-                                    self.command.append("向右")
+                                    self.command_queue.append("向右")
                                     self.hands_signal.setText("向右")
                                     val[0] = lr
                                     # self.me.send_rc_control(lr, 0, 0, 0)
                                 else:
                                     # print("向前")
-                                    self.command.append("向前")
+                                    self.command_queue.append("向前")
                                     self.hands_signal.setText("向前")
                                     val[1] = fb
                                     # self.me.send_rc_control(0, fb, 0, 0)
@@ -713,26 +652,26 @@ class Menu(QMainWindow, Ui_register_2):
                             if lmList[8][1] < LeftPx:  # 手指在第二象限
                                 if direction < 1:
                                     # print("向左")
-                                    self.command.append("向左")
+                                    self.command_queue.append("向左")
                                     self.hands_signal.setText("向左")
                                     val[0] = -lr
                                     # self.me.send_rc_control(-lr, 0, 0, 0)
                                 else:
                                     # print("向后")
-                                    self.command.append("向后")
+                                    self.command_queue.append("向后")
                                     self.hands_signal.setText("向后")
                                     val[1] = -fb
                                     # self.me.send_rc_control(0, -fb, 0, 0)
                             else:  # 手指在第四象限
                                 if direction < 1:
                                     # print("向右")
-                                    self.command.append("向右")
+                                    self.command_queue.append("向右")
                                     self.hands_signal.setText("向右")
                                     val[0] = lr
                                     # self.me.send_rc_control(lr, 0, 0, 0)
                                 else:
                                     # print("向后")
-                                    self.command.append("向后")
+                                    self.command_queue.append("向后")
                                     self.hands_signal.setText("向后")
                                     val[1] = -fb
                                     # self.me.send_rc_control(0, -fb, 0, 0)
@@ -747,26 +686,26 @@ class Menu(QMainWindow, Ui_register_2):
                             if lmList[8][1] < RighPx:  # 手指在第一象限
                                 if direction < 1:
                                     # print("向左转向")
-                                    self.command.append("向左转向")
+                                    self.command_queue.append("向左转向")
                                     self.hands_signal.setText("向左转向")
                                     val[3] = yv
                                     # self.me.send_rc_control(0, 0, 0, yv)
                                 else:
                                     # print("上升")
-                                    self.command.append("上升")
+                                    self.command_queue.append("上升")
                                     self.hands_signal.setText("上升")
                                     val[2] = ud
                                     # self.me.send_rc_control(0, 0, ud, 0)
                             else:  # 手指在第四象限
                                 if direction < 1:
                                     # print("向右转向")
-                                    self.command.append("向右转向")
+                                    self.command_queue.append("向右转向")
                                     self.hands_signal.setText("向右转向")
                                     val[3] = -yv
                                     # self.me.send_rc_control(0, 0, 0, -yv)
                                 else:
                                     # print("上升")
-                                    self.command.append("上升")
+                                    self.command_queue.append("上升")
                                     self.hands_signal.setText("上升")
                                     val[2] = ud
                                     # self.me.send_rc_control(0, 0, ud, 0)
@@ -774,32 +713,32 @@ class Menu(QMainWindow, Ui_register_2):
                             if lmList[8][1] < RighPx:  # 手指在第二象限
                                 if direction < 1:
                                     # print("向左转向")
-                                    self.command.append("向左转向")
+                                    self.command_queue.append("向左转向")
                                     self.hands_signal.setText("向左转向")
                                     val[3] = yv
                                     # self.me.send_rc_control(0, 0, 0, yv)
                                 else:
                                     # print("下降")
-                                    self.command.append("下降")
+                                    self.command_queue.append("下降")
                                     self.hands_signal.setText("下降")
                                     val[2] = -ud
                                     # self.me.send_rc_control(0, 0, -ud, 0)
                             else:  # 手指在第四象限
                                 if direction < 1:
                                     # print("向右转向")
-                                    self.command.append("向右转向")
+                                    self.command_queue.append("向右转向")
                                     self.hands_signal.setText("向右转向")
                                     val[3] = -yv
                                     # self.me.send_rc_control(0, 0, 0, -yv)
                                 else:
                                     # print("下降")
-                                    self.command.append("下降")
+                                    self.command_queue.append("下降")
                                     self.hands_signal.setText("下降")
                                     val[2] = -ud
                                     # self.me.send_rc_control(0, 0, -ud, 0)
                     else:
                         # print("悬停")
-                        self.command.append("悬停")
+                        self.command_queue.append("悬停")
                         self.hands_signal.setText("悬停")
                 
                 # print(1)
@@ -823,20 +762,20 @@ class Menu(QMainWindow, Ui_register_2):
             self.hands_control.setText("开启手势控制")
             self.textwindow.setText("手势控制模式已关闭")
             self.ground_view.clear()
-            self.command.clear()
+            self.command_queue.clear()
             self.ground_view.setText("地面端")
 
     def object_detection(self):
-        while(1):
-            if len(self.frame_to_tsk)==0:
-                    time.sleep(0.01)
-                    continue
-            else:
-                login_frame = self.frame_to_tsk.pop(0)
-                [result_cls,result_conf,bboxs]=self.object_model.predict(login_frame)
-                if result_cls.numel()>0:
-                    for cls,conf,bboxs in enumerate(result_cls,result_conf,bboxs):
-                        pass
+        while True:
+            if not self.frame_to_tsk:
+                time.sleep(0.01)
+                continue
+            login_frame = self.frame_to_tsk.popleft()
+            result_cls,result_conf,bboxs = self.object_model.predict(login_frame)
+            if result_cls.numel()>0:
+                for cls, conf, bbox in zip(result_cls.tolist(), result_conf.tolist(), bboxs.tolist()):
+                    # TODO: integrate detection results with UI display.
+                    pass
     def init_sitl(self):
         state=self.is_connect.isChecked()
         if state:
